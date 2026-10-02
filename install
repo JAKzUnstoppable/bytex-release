@@ -1,0 +1,139 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# ByteX Termux installer. Verify the signed manifest before anything is installed.
+set -euo pipefail
+
+BASE_URL="https://raw.githubusercontent.com/JAKzUnstoppable/bytex-release/main"
+APP_VERSION="1.0.0"
+
+die() {
+  printf 'ByteX installer: %s\n' "$*" >&2
+  exit 1
+}
+
+case "${PREFIX:-}" in
+  *com.termux*) ;;
+  *) die "This installer only runs inside Termux." ;;
+esac
+
+machine="$(uname -m 2>/dev/null || true)"
+case "$machine" in
+  aarch64|arm64) ARCH="aarch64" ;;
+  armv7l|armv8l|arm|armhf) ARCH="arm" ;;
+  *)
+    die "Unsupported architecture: ${machine:-unknown}. This release is for ARM phones."
+    ;;
+esac
+
+if ! command -v openssl >/dev/null 2>&1 || ! command -v sha256sum >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
+  pkg install -y openssl-tool coreutils tar ca-certificates \
+    || die "Could not install openssl, coreutils, and tar. ByteX was not installed."
+fi
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+cat > "$tmp/public.pem" <<'EOF'
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAiLOZydOh4fZg+8Tend2In0OhxHgcH8VyX/2sIV10rwQ=
+-----END PUBLIC KEY-----
+EOF
+
+fetch() {
+  url="$1"
+  dest="$2"
+  if [[ -n "${BYTEX_RELEASE_DIR:-}" ]]; then
+    rel="${url#${BASE_URL}/}"
+    cp "${BYTEX_RELEASE_DIR%/}/$rel" "$dest"
+    return
+  fi
+  curl -fsSL --retry 3 --retry-delay 2 -o "$dest" "$url" \
+    || die "Download failed. ByteX was not installed."
+}
+
+fetch "$BASE_URL/manifest.json" "$tmp/manifest.json"
+fetch "$BASE_URL/manifest.sig" "$tmp/manifest.sig"
+
+if ! openssl pkeyutl -verify -pubin -inkey "$tmp/public.pem" -rawin \
+  -in "$tmp/manifest.json" -sigfile "$tmp/manifest.sig" >/dev/null 2>&1; then
+  die "Release signature verification failed. ByteX was not installed."
+fi
+
+name="$(sed -n "s/.*\"${ARCH}\":{\"name\":\"\\([^\"]*\\)\",\"sha256\":\"[a-f0-9]*\".*/\\1/p" "$tmp/manifest.json")"
+want="$(sed -n "s/.*\"${ARCH}\":{\"name\":\"[^\"]*\",\"sha256\":\"\\([a-f0-9]*\\)\".*/\\1/p" "$tmp/manifest.json")"
+[[ -n "$name" && -n "$want" ]] || die "The signed manifest has no ${ARCH} release. ByteX was not installed."
+
+fetch "$BASE_URL/${ARCH}/${name}" "$tmp/$name"
+got="$(sha256sum "$tmp/$name" | awk '{print $1}')"
+if [[ "$got" != "$want" ]]; then
+  rm -f "$tmp/$name"
+  die "SHA-256 mismatch. ByteX was not installed."
+fi
+
+home_dir="${HOME}/.bytex"
+incoming="$home_dir/app/incoming"
+current="$home_dir/app/current"
+backup="$home_dir/app/backup"
+mkdir -p "$home_dir/app" "$home_dir/data" "$home_dir/config"
+rm -rf "$incoming"
+mkdir -p "$incoming"
+tar -xzf "$tmp/$name" -C "$incoming"
+
+python_magic="$(od -An -t x1 -N 4 "$incoming/bytex.bin" 2>/dev/null | tr -d ' \n' || true)"
+[[ "$python_magic" == "7f454c46" ]] || {
+  rm -rf "$incoming"
+  die "Downloaded file is not an ELF executable. ByteX was not installed."
+}
+class="$(od -An -t u1 -j 4 -N 1 "$incoming/bytex.bin" | tr -d ' ')"
+machine_bytes="$(od -An -t x1 -j 18 -N 2 "$incoming/bytex.bin" | tr -d ' \n')"
+case "$ARCH:$class:$machine_bytes" in
+  aarch64:2:b700|arm:1:2800) ;;
+  *)
+    rm -rf "$incoming"
+    die "Downloaded file is the wrong architecture. ByteX was not installed."
+    ;;
+esac
+[[ -f "$incoming/libbytex_core.so" ]] || {
+  rm -rf "$incoming"
+  die "Native library is missing from the release. ByteX was not installed."
+}
+if find "$incoming" -type f \( -name '*.py' -o -name '*.pyc' \) | grep -q .; then
+  rm -rf "$incoming"
+  die "Release contains Python source. ByteX was not installed."
+fi
+
+chmod 755 "$incoming/bytex.bin"
+hash="$(sha256sum "$incoming/bytex.bin" | awk '{print $1}')"
+if [[ -d "$current" ]]; then
+  rm -rf "$backup"
+  mv "$current" "$backup"
+fi
+mv "$incoming" "$current"
+
+export LD_LIBRARY_PATH="$current:$PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export BYTEX_HOME="$home_dir"
+if ! "$current/bytex.bin" version >/dev/null 2>&1; then
+  rm -rf "$current"
+  if [[ -d "$backup" ]]; then
+    mv "$backup" "$current"
+  fi
+  die "The new ByteX build did not start. The previous build was restored."
+fi
+
+printf '%s\n' "$BASE_URL" > "$home_dir/config/release_base.url"
+cat > "$PREFIX/bin/bytex" <<EOF
+#!/data/data/com.termux/files/usr/bin/bash
+set -euo pipefail
+APP="\$HOME/.bytex/app/current"
+export BYTEX_HOME="\$HOME/.bytex"
+export BYTEX_INTEGRITY_HASH=${hash}
+export PREFIX="\${PREFIX:-/data/data/com.termux/files/usr}"
+export PATH="\$PREFIX/bin:\$PATH"
+export TMPDIR="\$PREFIX/tmp"
+export LANG="\${LANG:-en_US.UTF-8}"
+export LD_LIBRARY_PATH="\$APP:\$PREFIX/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+exec "\$APP/bytex.bin" "\$@"
+EOF
+chmod 755 "$PREFIX/bin/bytex"
+
+printf 'ByteX %s installed for %s.\n' "$APP_VERSION" "$ARCH"
+exec "$PREFIX/bin/bytex"
